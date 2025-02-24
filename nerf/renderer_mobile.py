@@ -284,14 +284,21 @@ class NeRFRenderer(nn.Module):
             self.local_step += 1
 
             xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, counter, self.mean_count, perturb, 128, force_all_rays, dt_gamma, max_steps)
-
+            # print("xyzs shape ", xyzs.shape)
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
             
-            sigmas, rgbs = self(xyzs, dirs)
+            alphas, rgbs = self(xyzs, dirs)
+            # print("alphas mean ", alphas.mean())
             # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             # sigmas = density_outputs['sigma']
             # rgbs = self.color(xyzs, dirs, **density_outputs)
+            # print(deltas[:,1].mean())
+            sigmas = -torch.log(1-alphas )
+            # print(sigmas.mean())
             sigmas = self.density_scale * sigmas
+
+            # print("T_TRESH_", T_thresh)
+
 
             #print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
 
@@ -352,11 +359,13 @@ class NeRFRenderer(nn.Module):
 
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 
-                sigmas, rgbs = self(xyzs, dirs)
+                alphas, rgbs = self(xyzs, dirs)
                 # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
                 # sigmas = density_outputs['sigma']
                 # rgbs = self.color(xyzs, dirs, **density_outputs)
+                sigmas = -torch.log(1-alphas) 
                 sigmas = self.density_scale * sigmas
+
 
                 raymarching.composite_rays(n_alive, n_step, rays_alive, rays_t, sigmas, rgbs, deltas, weights_sum, depth, image, T_thresh)
 
@@ -478,7 +487,9 @@ class NeRFRenderer(nn.Module):
                             # add noise in [-hgs, hgs]
                             cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
                             # query density
-                            sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                            alphas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                            sigmas = -torch.log(1-alphas)
+                            print(sigmas.mean())
                             sigmas *= self.density_scale
                             # assign 
                             tmp_grid[cas, indices] = sigmas
@@ -508,7 +519,9 @@ class NeRFRenderer(nn.Module):
                 # add noise in [-hgs, hgs]
                 cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
                 # query density
-                sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                alphas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                sigmas = -torch.log(1-alphas )
+                print(sigmas.mean())
                 sigmas *= self.density_scale
                 # assign 
                 tmp_grid[cas, indices] = sigmas

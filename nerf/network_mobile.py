@@ -80,7 +80,9 @@ class NeRFNetwork(NeRFRenderer):
         h = self.sigma_net(x)
 
         #sigma = F.relu(h[..., 0])
-        opacity = torch.sigmoid(h[..., 0] - 8)
+        opacity = torch.sigmoid(h[..., 0] - 2)
+        opacity = torch.clamp(opacity, 0.001, 0.999)
+        # sigma = trunc_exp(h[..., 0])
         geo_feat = torch.sigmoid(h[..., 1:])
 
         # color
@@ -100,7 +102,10 @@ class NeRFNetwork(NeRFRenderer):
         h = self.sigma_net(x)
 
         #sigma = F.relu(h[..., 0])
-        opacity = torch.sigmoid(h[..., 0] - 8)
+        opacity = torch.sigmoid(h[..., 0] - 2)
+        opacity = torch.clamp(opacity, 0.001, 0.999)
+
+        # sigma = trunc_exp(h[..., 0])
         geo_feat = torch.sigmoid(h[..., 1:])
 
         return {
