@@ -6,7 +6,7 @@ import numpy as np
 
 import tinycudann as tcnn
 from activation import trunc_exp
-from .renderer import NeRFRenderer
+from .renderer_mobile import NeRFRenderer
 
 
 class NeRFNetwork(NeRFRenderer):
@@ -74,13 +74,13 @@ class NeRFNetwork(NeRFRenderer):
         # d: [N, 3], nomalized in [-1, 1]
 
 
-        # sigma
+        # sigma but lets actually try opacity
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
         #sigma = F.relu(h[..., 0])
-        sigma = trunc_exp(h[..., 0])
+        opacity = torch.sigmoid(h[..., 0] - 8)
         geo_feat = torch.sigmoid(h[..., 1:])
 
         # color
@@ -90,7 +90,7 @@ class NeRFNetwork(NeRFRenderer):
         # sigmoid activation for rgb
         color = torch.sigmoid(k)
 
-        return sigma, color
+        return opacity, color
 
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
@@ -100,11 +100,11 @@ class NeRFNetwork(NeRFRenderer):
         h = self.sigma_net(x)
 
         #sigma = F.relu(h[..., 0])
-        sigma = trunc_exp(h[..., 0])
+        opacity = torch.sigmoid(h[..., 0] - 8)
         geo_feat = torch.sigmoid(h[..., 1:])
 
         return {
-            'sigma': sigma,
+            'sigma': opacity,
             'geo_feat': geo_feat,
         }
 

@@ -161,11 +161,11 @@ class NeRFRenderer(nn.Module):
         #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
 
         # query SDF and RGB
-        density_outputs = self.density(xyzs.reshape(-1, 3))
+        opacity_outputs = self.density(xyzs.reshape(-1, 3))
 
         #sigmas = density_outputs['sigma'].view(N, num_steps) # [N, T]
-        for k, v in density_outputs.items():
-            density_outputs[k] = v.view(N, num_steps, -1)
+        for k, v in opacity_outputs.items():
+            opacity_outputs[k] = v.view(N, num_steps, -1)
 
         # upsample z_vals (nerf-like)
         if upsample_steps > 0:
@@ -173,8 +173,8 @@ class NeRFRenderer(nn.Module):
 
                 deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T-1]
                 deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-
-                alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T]
+                
+                alphas = opacity_outputs["sigma"].squeeze(-1) # [N, T]
                 alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+1]
                 weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T]
 
@@ -186,10 +186,10 @@ class NeRFRenderer(nn.Module):
                 new_xyzs = torch.min(torch.max(new_xyzs, aabb[:3]), aabb[3:]) # a manual clip.
 
             # only forward new points to save computation
-            new_density_outputs = self.density(new_xyzs.reshape(-1, 3))
+            new_opacity_outputs = self.density(new_xyzs.reshape(-1, 3))
             #new_sigmas = new_density_outputs['sigma'].view(N, upsample_steps) # [N, t]
-            for k, v in new_density_outputs.items():
-                new_density_outputs[k] = v.view(N, upsample_steps, -1)
+            for k, v in new_opacity_outputs.items():
+                new_opacity_outputs[k] = v.view(N, upsample_steps, -1)
 
             # re-order
             z_vals = torch.cat([z_vals, new_z_vals], dim=1) # [N, T+t]
@@ -198,22 +198,22 @@ class NeRFRenderer(nn.Module):
             xyzs = torch.cat([xyzs, new_xyzs], dim=1) # [N, T+t, 3]
             xyzs = torch.gather(xyzs, dim=1, index=z_index.unsqueeze(-1).expand_as(xyzs))
 
-            for k in density_outputs:
-                tmp_output = torch.cat([density_outputs[k], new_density_outputs[k]], dim=1)
-                density_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
+            for k in opacity_outputs:
+                tmp_output = torch.cat([opacity_outputs[k], new_opacity_outputs[k]], dim=1)
+                opacity_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
 
         deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
         deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-        alphas = 1 - torch.exp(-deltas * self.density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
+        alphas = opacity_outputs["sigma"].squeeze(-1) # [N, T+t]
         alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
         weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
 
         dirs = rays_d.view(-1, 1, 3).expand_as(xyzs)
-        for k, v in density_outputs.items():
-            density_outputs[k] = v.view(-1, v.shape[-1])
+        for k, v in opacity_outputs.items():
+            opacity_outputs[k] = v.view(-1, v.shape[-1])
 
         mask = weights > 1e-4 # hard coded
-        rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **density_outputs)
+        rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **opacity_outputs)
         rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
 
         #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
