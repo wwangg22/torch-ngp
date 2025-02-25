@@ -15,7 +15,7 @@ class NeRFNetwork(NeRFRenderer):
                  encoding_dir="SphericalHarmonics",
                  num_layers=2,
                  hidden_dim=64,
-                 geo_feat_dim=8,
+                 geo_feat_dim=7,
                  hidden_dim_color=16,
                  bound=1,
                  **kwargs
@@ -68,6 +68,7 @@ class NeRFNetwork(NeRFRenderer):
             },
         )
 
+
     
     def forward(self, x, d):
         # x: [N, 3], in [-bound, bound]
@@ -96,7 +97,7 @@ class NeRFNetwork(NeRFRenderer):
 
     def density(self, x):
         # x: [N, 3], in [-bound, bound]
-
+        # print("bound ", self.bound)
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
@@ -119,6 +120,10 @@ class NeRFNetwork(NeRFRenderer):
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
 
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        
+        # print("mask ", mask.shape)
+        # print("x ", x.shape)
+        # print("d ", d.shape)
 
         if mask is not None:
             rgbs = torch.zeros(mask.shape[0], 3, dtype=x.dtype, device=x.device) # [N, 3]
@@ -147,14 +152,27 @@ class NeRFNetwork(NeRFRenderer):
 
     # optimizer utils
     def get_params(self, lr):
-
-        params = [
-            {'params': self.encoder.parameters(), 'lr': lr},
-            {'params': self.sigma_net.parameters(), 'lr': lr},
-            {'params': self.color_net.parameters(), 'lr': lr}, 
-        ]
-        if self.bg_radius > 0:
-            params.append({'params': self.encoder_bg.parameters(), 'lr': lr})
-            params.append({'params': self.bg_net.parameters(), 'lr': lr})
-        
-        return params
+        if self.mobileNERF:
+            params = [
+                {'params': self.encoder.parameters(), 'lr': lr},
+                {'params': self.sigma_net.parameters(), 'lr': lr},
+                {'params': self.color_net.parameters(), 'lr': lr},
+                {'params': self.point_grid, 'lr': lr},
+                {'params': self.acc_grid, 'lr': lr},
+            ]
+            if self.bg_radius > 0:
+                params.append({'params': self.encoder_bg.parameters(), 'lr': lr})
+                params.append({'params': self.bg_net.parameters(), 'lr': lr})
+            
+            return params
+        else:
+            params = [
+                {'params': self.encoder.parameters(), 'lr': lr},
+                {'params': self.sigma_net.parameters(), 'lr': lr},
+                {'params': self.color_net.parameters(), 'lr': lr}
+            ]
+            if self.bg_radius > 0:
+                params.append({'params': self.encoder_bg.parameters(), 'lr': lr})
+                params.append({'params': self.bg_net.parameters(), 'lr': lr})
+            
+            return params

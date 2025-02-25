@@ -27,6 +27,7 @@ import trimesh
 import mcubes
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
+from .mobileNERF_func import *
 
 from packaging import version as pver
 import lpips
@@ -337,6 +338,7 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 mobileNERF=False,
                  ):
         
         self.name = name
@@ -354,6 +356,7 @@ class Trainer(object):
         self.max_keep_ckpt = max_keep_ckpt
         self.eval_interval = eval_interval
         self.use_checkpoint = use_checkpoint
+        self.mobileNERF = mobileNERF
         self.use_tensorboardX = use_tensorboardX
         self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         self.scheduler_update_every_step = scheduler_update_every_step
@@ -465,7 +468,7 @@ class Trainer(object):
 
     ### ------------------------------	
 
-    def train_step(self, data):
+    def train_step(self, data, epoch):
 
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
@@ -477,8 +480,10 @@ class Trainer(object):
             H, W = data['H'], data['W']
 
             # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
+            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, epoch=epoch, force_all_rays=True, **vars(self.opt))
             pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
+            if self.mobileNERF:
+                pred_rgb_b = outputs['image_b'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
 
             # [debug] uncomment to plot the images used in train_step
             #torch_vis_2d(pred_rgb[0])
@@ -507,13 +512,46 @@ class Trainer(object):
         else:
             gt_rgb = images
 
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, epoch=epoch, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
     
         pred_rgb = outputs['image']
-
+        pred_rgb_b = outputs['image_b'] if self.mobileNERF else None
+        acc_grid_masks = outputs['acc'] if self.mobileNERF else None
+        points = outputs['points'] if self.mobileNERF else None
+        weights = outputs['weights_sum'] if self.mobileNERF else None
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+        if self.mobileNERF:
+            loss_b = self.criterion(pred_rgb_b, gt_rgb).mean(-1)
+            loss_acc = torch.mean(
+                torch.maximum(weights.detach() - acc_grid_masks,
+                            torch.zeros_like(acc_grid_masks))  # ensures same shape/device
+            )
+            
+            # 2) Add mean of abs(vars[1]) scaled by 1e-5
+            loss_acc += torch.mean(torch.abs(self.model.acc_grid)) * 1e-5
+            
+            # 3) Add total variation of vars[1] scaled by 1e-5
+            loss_acc += compute_TV(self.model.acc_grid) * 1e-5
+            
+            point_loss = torch.abs(points)
+
+            # 2) Compute scaled versions
+            point_loss_out = point_loss * 1000.0
+            point_loss_in  = point_loss * 0.01
+
+            # 3) Create mask (ensure all variables are Tensors/scalars on the same device)
+            threshold = (self.model.grid_max - self.model.grid_min) / self.model.grid_size / 2
+            point_mask = point_loss < threshold
+
+            # 4) Where the mask is True, use point_loss_in; otherwise, use point_loss_out
+            point_loss = torch.where(point_mask, point_loss_in, point_loss_out)
+
+            # 5) Finally, take the mean
+            point_loss = point_loss.mean()
+            print("acc grid mean", self.model.acc_grid.mean())
+            print(point_loss, loss_acc)
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -524,6 +562,7 @@ class Trainer(object):
             # torch_vis_2d(pred_rgb[0])
 
             # LPIPS loss [not useful...]
+            print("patched based render")
             loss = loss + 1e-3 * self.criterion_lpips(pred_rgb, gt_rgb)
 
         # special case for CCNeRF's rank-residual training
@@ -553,7 +592,8 @@ class Trainer(object):
 
             # put back
             self.error_map[index] = error_map
-
+        loss += point_loss
+        loss += loss_acc
         loss = loss.mean()
 
         # extra loss
@@ -581,13 +621,19 @@ class Trainer(object):
             gt_rgb = images
         
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        if self.mobileNERF:
+            pred_rgb = outputs['image'].reshape(B, H, W, 3)
+           
+            loss = self.criterion(pred_rgb, gt_rgb).mean()
 
-        pred_rgb = outputs['image'].reshape(B, H, W, 3)
-        pred_depth = outputs['depth'].reshape(B, H, W)
+            return pred_rgb, gt_rgb, loss
+        else:
+            pred_rgb = outputs['image'].reshape(B, H, W, 3)
+            pred_depth = outputs['depth'].reshape(B, H, W)
 
-        loss = self.criterion(pred_rgb, gt_rgb).mean()
+            loss = self.criterion(pred_rgb, gt_rgb).mean()
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+            return pred_rgb, pred_depth, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
@@ -645,7 +691,7 @@ class Trainer(object):
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
 
-            self.train_one_epoch(train_loader)
+            self.train_one_epoch(train_loader, epoch)
 
             if self.workspace is not None and self.local_rank == 0:
                 self.save_checkpoint(full=True, best=False)
@@ -828,7 +874,7 @@ class Trainer(object):
 
         return outputs
 
-    def train_one_epoch(self, loader):
+    def train_one_epoch(self, loader, epoch):
         self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
@@ -861,7 +907,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss = self.train_step(data, epoch)
          
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -939,7 +985,10 @@ class Trainer(object):
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    if self.mobileNERF:
+                        preds, truths, loss = self.eval_step(data)
+                    else:
+                        preds, preds_depth, truths, loss = self.eval_step(data)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -949,10 +998,10 @@ class Trainer(object):
                     preds_list = [torch.zeros_like(preds).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(preds_list, preds)
                     preds = torch.cat(preds_list, dim=0)
-
-                    preds_depth_list = [torch.zeros_like(preds_depth).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
-                    dist.all_gather(preds_depth_list, preds_depth)
-                    preds_depth = torch.cat(preds_depth_list, dim=0)
+                    if not self.mobileNERF:
+                        preds_depth_list = [torch.zeros_like(preds_depth).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
+                        dist.all_gather(preds_depth_list, preds_depth)
+                        preds_depth = torch.cat(preds_depth_list, dim=0)
 
                     truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(truths_list, truths)
@@ -976,15 +1025,15 @@ class Trainer(object):
 
                     if self.opt.color_space == 'linear':
                         preds = linear_to_srgb(preds)
-
+                    
                     pred = preds[0].detach().cpu().numpy()
                     pred = (pred * 255).astype(np.uint8)
-
-                    pred_depth = preds_depth[0].detach().cpu().numpy()
-                    pred_depth = (pred_depth * 255).astype(np.uint8)
-                    
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(save_path_depth, pred_depth)
+                    if not self.mobileNERF:
+                        pred_depth = preds_depth[0].detach().cpu().numpy()
+                        pred_depth = (pred_depth * 255).astype(np.uint8)
+                    
+                        cv2.imwrite(save_path_depth, pred_depth)
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                     pbar.update(loader.batch_size)

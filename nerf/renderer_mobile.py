@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import raymarching
+from .mobileNERF_func import *
 from .utils import custom_meshgrid
 
 def sample_pdf(bins, weights, n_samples, det=False):
@@ -57,15 +58,17 @@ def plot_pointcloud(pc, color=None):
     sphere = trimesh.creation.icosphere(radius=1)
     trimesh.Scene([pc, axes, sphere]).show()
 
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class NeRFRenderer(nn.Module):
     def __init__(self,
                  bound=1,
                  cuda_ray=False,
+                 mobileNERF = False,
                  density_scale=1, # scale up deltas (or sigmas), to make the density grid more sharp. larger value than 1 usually improves performance.
                  min_near=0.2,
                  density_thresh=0.01,
                  bg_radius=-1,
+                 target_epoch=200,
                  ):
         super().__init__()
 
@@ -76,6 +79,7 @@ class NeRFRenderer(nn.Module):
         self.min_near = min_near
         self.density_thresh = density_thresh
         self.bg_radius = bg_radius # radius of the background sphere.
+        self.mobileNERF = mobileNERF
 
         # prepare aabb with a 6D tensor (xmin, ymin, zmin, xmax, ymax, zmax)
         # NOTE: aabb (can be rectangular) is only used to generate points, we still rely on bound (always cubic) to calculate density grid and hashing.
@@ -99,7 +103,32 @@ class NeRFRenderer(nn.Module):
             self.register_buffer('step_counter', step_counter)
             self.mean_count = 0
             self.local_step = 0
+        if mobileNERF:
+
+            self.threshold = -10000
+            # density grid
+            self.point_grid = nn.Parameter(torch.zeros([self.grid_size, self.grid_size, self.grid_size, 3])) # [CAS, H * H * H, 3]
+            self.acc_grid = nn.Parameter(torch.zeros([self.grid_size, self.grid_size, self.grid_size])) # [CAS, H * H * H, 3]
+
+            self.scene_grid_scale = 1.2
+  
+            self.grid_min = torch.tensor([-1, -1, -1]).to(device) * self.scene_grid_scale
+            self.grid_max = torch.tensor([ 1,  1,  1]).to(device) * self.scene_grid_scale
+
+            self.cell_size_x = (self.grid_max[0] - self.grid_min[0])/self.grid_size
+            self.half_cell_size_x = self.cell_size_x/2
+            self.neg_half_cell_size_x = -self.half_cell_size_x
+            self.cell_size_y = (self.grid_max[1] - self.grid_min[1])/self.grid_size
+            self.half_cell_size_y = self.cell_size_y/2
+            self.neg_half_cell_size_y = -self.half_cell_size_y
+            self.cell_size_z = (self.grid_max[2] - self.grid_min[2])/self.grid_size
+            self.half_cell_size_z = self.cell_size_z/2
+            self.neg_half_cell_size_z = -self.half_cell_size_z
+            
+            self.point_grid_diff_lr_scale = 16.0/self.grid_size
+
     
+
     def forward(self, x, d):
         raise NotImplementedError()
 
@@ -122,135 +151,194 @@ class NeRFRenderer(nn.Module):
         self.mean_count = 0
         self.local_step = 0
 
-    def run(self, rays_o, rays_d, num_steps=128, upsample_steps=128, bg_color=None, perturb=False, **kwargs):
-        # rays_o, rays_d: [B, N, 3], assumes B == 1
-        # bg_color: [3] in range [0, 1]
-        # return: image: [B, N, 3], depth: [B, N]
-
-        prefix = rays_o.shape[:-1]
-        rays_o = rays_o.contiguous().view(-1, 3)
-        rays_d = rays_d.contiguous().view(-1, 3)
-
-        N = rays_o.shape[0] # N = B * N, in fact
-        device = rays_o.device
-
-        # choose aabb
-        aabb = self.aabb_train if self.training else self.aabb_infer
-
-        # sample steps
-        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
-        nears.unsqueeze_(-1)
-        fars.unsqueeze_(-1)
-
-        #print(f'nears = {nears.min().item()} ~ {nears.max().item()}, fars = {fars.min().item()} ~ {fars.max().item()}')
-
-        z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0) # [1, T]
-        z_vals = z_vals.expand((N, num_steps)) # [N, T]
-        z_vals = nears + (fars - nears) * z_vals # [N, T], in [nears, fars]
-
-        # perturb z_vals
-        sample_dist = (fars - nears) / num_steps
-        if perturb:
-            z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
-            #z_vals = z_vals.clamp(nears, fars) # avoid out of bounds xyzs.
-
-        # generate xyzs
-        xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals.unsqueeze(-1) # [N, 1, 3] * [N, T, 1] -> [N, T, 3]
-        xyzs = torch.min(torch.max(xyzs, aabb[:3]), aabb[3:]) # a manual clip.
-
-        #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
-
-        # query SDF and RGB
-        opacity_outputs = self.density(xyzs.reshape(-1, 3))
-
-        #sigmas = density_outputs['sigma'].view(N, num_steps) # [N, T]
-        for k, v in opacity_outputs.items():
-            opacity_outputs[k] = v.view(N, num_steps, -1)
-
-        # upsample z_vals (nerf-like)
-        if upsample_steps > 0:
-            with torch.no_grad():
-
-                deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T-1]
-                deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-                
-                alphas = opacity_outputs["sigma"].squeeze(-1) # [N, T]
-                alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+1]
-                weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T]
-
-                # sample new z_vals
-                z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [N, T-1]
-                new_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], upsample_steps, det=not self.training).detach() # [N, t]
-
-                new_xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1) # [N, 1, 3] * [N, t, 1] -> [N, t, 3]
-                new_xyzs = torch.min(torch.max(new_xyzs, aabb[:3]), aabb[3:]) # a manual clip.
-
-            # only forward new points to save computation
-            new_opacity_outputs = self.density(new_xyzs.reshape(-1, 3))
-            #new_sigmas = new_density_outputs['sigma'].view(N, upsample_steps) # [N, t]
-            for k, v in new_opacity_outputs.items():
-                new_opacity_outputs[k] = v.view(N, upsample_steps, -1)
-
-            # re-order
-            z_vals = torch.cat([z_vals, new_z_vals], dim=1) # [N, T+t]
-            z_vals, z_index = torch.sort(z_vals, dim=1)
-
-            xyzs = torch.cat([xyzs, new_xyzs], dim=1) # [N, T+t, 3]
-            xyzs = torch.gather(xyzs, dim=1, index=z_index.unsqueeze(-1).expand_as(xyzs))
-
-            for k in opacity_outputs:
-                tmp_output = torch.cat([opacity_outputs[k], new_opacity_outputs[k]], dim=1)
-                opacity_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
-
-        deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
-        deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-        alphas = opacity_outputs["sigma"].squeeze(-1) # [N, T+t]
-        alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
-        weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
-
-        dirs = rays_d.view(-1, 1, 3).expand_as(xyzs)
-        for k, v in opacity_outputs.items():
-            opacity_outputs[k] = v.view(-1, v.shape[-1])
-
-        mask = weights > 1e-4 # hard coded
-        rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **opacity_outputs)
-        rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
-
-        #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
-
-        # calculate weight_sum (mask)
-        weights_sum = weights.sum(dim=-1) # [N]
-        
-        # calculate depth 
-        ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
-        depth = torch.sum(weights * ori_z_vals, dim=-1)
-
-        # calculate color
-        image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]
-
-        # mix background color
-        if self.bg_radius > 0:
-            # use the bg model to calculate bg_color
-            sph = raymarching.sph_from_ray(rays_o, rays_d, self.bg_radius) # [N, 2] in [-1, 1]
-            bg_color = self.background(sph, rays_d.reshape(-1, 3)) # [N, 3]
-        elif bg_color is None:
-            bg_color = 1
+    def run(self, rays_o, rays_d, epoch=None, num_steps=128, upsample_steps=128, bg_color=None, perturb=False, **kwargs):
+        if self.mobileNERF:
+            print("epoch ", epoch)
+            if epoch is not None and epoch > 50:
+                threshold = 0.1
+            else:
+                threshold = -100000
+            grid_indices, grid_masks = gridcell_from_rays(rays_o, rays_d, self.acc_grid,num_steps, threshold,
+                                                    grid_min=self.grid_min, grid_max=self.grid_max, point_grid_size=self.grid_size)
+            grid_indices = grid_indices.squeeze(0)
+            grid_masks = grid_masks.squeeze(0)
+            N = grid_indices.shape[0]
+            pts, grid_masks, points, fake_t = compute_undc_intersection(self.point_grid,
+                                                    grid_indices, grid_masks, rays_o, rays_d, 
+                                                    num_steps, self.grid_min, self.grid_max, self.grid_size,
+                                                    self.cell_size_x, self.cell_size_y, self.cell_size_z,
+                                                    self.point_grid_diff_lr_scale)
+            pts = pts.squeeze(0)
+            grid_masks = grid_masks.squeeze(0)
+            points = points.squeeze(0)
+            fake_t = fake_t.squeeze(0)
             
-        image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+            pts_flattened = pts.view(-1, 3)
+            # print(pts_flattened.max(), pts_flattened.min())
+            # print(pts_flattened.mean())
+            
+            opacity_info = self.density(pts_flattened)
+            alphas = opacity_info['sigma']
+            alphas = alphas.view(N, -1)
+            # alphas = alphas * grid_masks
+            
+            weights = compute_volumetric_rendering_weights_with_alpha(alphas)
 
-        image = image.view(*prefix, 3)
-        depth = depth.view(*prefix)
+            acc = weights.sum(axis=-1) 
+            
+            alphas_b = alphas + ((alphas>0.5).float() - alphas).detach()
+            weights_b = compute_volumetric_rendering_weights_with_alpha(alphas_b)
+            
+            acc_b = weights_b.sum(axis=-1)
+            
+            duplicated_rays_d = rays_d.squeeze(0).unsqueeze(1).expand_as(pts)
+            rgbs = self.color(pts.reshape(-1, 3), duplicated_rays_d.reshape(-1, 3), mask=grid_masks.reshape(-1), **opacity_info)
+            rgbs = rgbs.view(N, -1, 3)
+            
+            image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2).unsqueeze(0)
+            
+            image_b = torch.sum(weights_b.unsqueeze(-1) * rgbs, dim=-2).unsqueeze(0)          
+            
+            acc_grid_masks = get_acc_grid_masks(pts, self.acc_grid, self.grid_min, self.grid_max, self.grid_size)
+            acc_grid_masks = acc_grid_masks*grid_masks
+            # print("acc_grid_masks ", acc_grid_masks.shape)
+            return {
+                'image': image,
+                'image_b': image_b,
+                'weights_sum': weights,
+                'weights_sum_b': weights_b,
+                'points': points,
+                'acc': acc_grid_masks,
+            }
+        else:
+            # rays_o, rays_d: [B, N, 3], assumes B == 1
+            # bg_color: [3] in range [0, 1]
+            # return: image: [B, N, 3], depth: [B, N]
 
-        # tmp: reg loss in mip-nerf 360
-        # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
-        # mid_zs = (z_vals + z_vals_shifted) / 2 # [N, T]
-        # loss_dist = (torch.abs(mid_zs.unsqueeze(1) - mid_zs.unsqueeze(2)) * (weights.unsqueeze(1) * weights.unsqueeze(2))).sum() + 1/3 * ((z_vals_shifted - z_vals_shifted) * (weights ** 2)).sum()
+            prefix = rays_o.shape[:-1]
+            rays_o = rays_o.contiguous().view(-1, 3)
+            rays_d = rays_d.contiguous().view(-1, 3)
 
-        return {
-            'depth': depth,
-            'image': image,
-            'weights_sum': weights_sum,
-        }
+            N = rays_o.shape[0] # N = B * N, in fact
+            device = rays_o.device
+
+            # choose aabb
+            aabb = self.aabb_train if self.training else self.aabb_infer
+
+            # sample steps
+            nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
+            nears.unsqueeze_(-1)
+            fars.unsqueeze_(-1)
+
+            #print(f'nears = {nears.min().item()} ~ {nears.max().item()}, fars = {fars.min().item()} ~ {fars.max().item()}')
+
+            z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0) # [1, T]
+            z_vals = z_vals.expand((N, num_steps)) # [N, T]
+            z_vals = nears + (fars - nears) * z_vals # [N, T], in [nears, fars]
+
+            # perturb z_vals
+            sample_dist = (fars - nears) / num_steps
+            if perturb:
+                z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
+                #z_vals = z_vals.clamp(nears, fars) # avoid out of bounds xyzs.
+
+            # generate xyzs
+            xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * z_vals.unsqueeze(-1) # [N, 1, 3] * [N, T, 1] -> [N, T, 3]
+            xyzs = torch.min(torch.max(xyzs, aabb[:3]), aabb[3:]) # a manual clip.
+
+            #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
+
+            # query SDF and RGB
+            opacity_outputs = self.density(xyzs.reshape(-1, 3))
+
+            #sigmas = density_outputs['sigma'].view(N, num_steps) # [N, T]
+            for k, v in opacity_outputs.items():
+                opacity_outputs[k] = v.view(N, num_steps, -1)
+
+            # upsample z_vals (nerf-like)
+            if upsample_steps > 0:
+                with torch.no_grad():
+
+                    deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T-1]
+                    deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
+                    
+                    alphas = opacity_outputs["sigma"].squeeze(-1) # [N, T]
+                    alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+1]
+                    weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T]
+
+                    # sample new z_vals
+                    z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [N, T-1]
+                    new_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], upsample_steps, det=not self.training).detach() # [N, t]
+
+                    new_xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1) # [N, 1, 3] * [N, t, 1] -> [N, t, 3]
+                    new_xyzs = torch.min(torch.max(new_xyzs, aabb[:3]), aabb[3:]) # a manual clip.
+
+                # only forward new points to save computation
+                new_opacity_outputs = self.density(new_xyzs.reshape(-1, 3))
+                #new_sigmas = new_density_outputs['sigma'].view(N, upsample_steps) # [N, t]
+                for k, v in new_opacity_outputs.items():
+                    new_opacity_outputs[k] = v.view(N, upsample_steps, -1)
+
+                # re-order
+                z_vals = torch.cat([z_vals, new_z_vals], dim=1) # [N, T+t]
+                z_vals, z_index = torch.sort(z_vals, dim=1)
+
+                xyzs = torch.cat([xyzs, new_xyzs], dim=1) # [N, T+t, 3]
+                xyzs = torch.gather(xyzs, dim=1, index=z_index.unsqueeze(-1).expand_as(xyzs))
+
+                for k in opacity_outputs:
+                    tmp_output = torch.cat([opacity_outputs[k], new_opacity_outputs[k]], dim=1)
+                    opacity_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
+
+            deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
+            deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
+            alphas = opacity_outputs["sigma"].squeeze(-1) # [N, T+t]
+            alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
+            weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
+
+            dirs = rays_d.view(-1, 1, 3).expand_as(xyzs)
+            for k, v in opacity_outputs.items():
+                opacity_outputs[k] = v.view(-1, v.shape[-1])
+
+            mask = weights > 1e-4 # hard coded
+            rgbs = self.color(xyzs.reshape(-1, 3), dirs.reshape(-1, 3), mask=mask.reshape(-1), **opacity_outputs)
+            rgbs = rgbs.view(N, -1, 3) # [N, T+t, 3]
+
+            #print(xyzs.shape, 'valid_rgb:', mask.sum().item())
+
+            # calculate weight_sum (mask)
+            weights_sum = weights.sum(dim=-1) # [N]
+            
+            # calculate depth 
+            ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
+            depth = torch.sum(weights * ori_z_vals, dim=-1)
+
+            # calculate color
+            image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [N, 3], in [0, 1]
+
+            # mix background color
+            if self.bg_radius > 0:
+                # use the bg model to calculate bg_color
+                sph = raymarching.sph_from_ray(rays_o, rays_d, self.bg_radius) # [N, 2] in [-1, 1]
+                bg_color = self.background(sph, rays_d.reshape(-1, 3)) # [N, 3]
+            elif bg_color is None:
+                bg_color = 1
+                
+            image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+
+            image = image.view(*prefix, 3)
+            depth = depth.view(*prefix)
+
+            # tmp: reg loss in mip-nerf 360
+            # z_vals_shifted = torch.cat([z_vals[..., 1:], sample_dist * torch.ones_like(z_vals[..., :1])], dim=-1)
+            # mid_zs = (z_vals + z_vals_shifted) / 2 # [N, T]
+            # loss_dist = (torch.abs(mid_zs.unsqueeze(1) - mid_zs.unsqueeze(2)) * (weights.unsqueeze(1) * weights.unsqueeze(2))).sum() + 1/3 * ((z_vals_shifted - z_vals_shifted) * (weights ** 2)).sum()
+
+            return {
+                'depth': depth,
+                'image': image,
+                'weights_sum': weights_sum,
+            }
 
 
     def run_cuda(self, rays_o, rays_d, dt_gamma=0, bg_color=None, perturb=False, force_all_rays=False, max_steps=1024, T_thresh=1e-4, **kwargs):
@@ -288,16 +376,17 @@ class NeRFRenderer(nn.Module):
             #plot_pointcloud(xyzs.reshape(-1, 3).detach().cpu().numpy())
             
             alphas, rgbs = self(xyzs, dirs)
+            # alphas = (alphas*5  + 5*(alphas + ((alphas > 0.5).float() - alphas).detach())) / 10
+            # ratio = min((self.epoch / self.target_epoch), 1.0)
+            # alphas = (alphas * (1-ratio) + (ratio)*(alphas  + ((alphas > 0.5).float() - alphas).detach()))
+            # alphas =(alphas + ((alphas > 0.5).float() - alphas).detach())
             # print("alphas mean ", alphas.mean())
             # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
             # sigmas = density_outputs['sigma']
             # rgbs = self.color(xyzs, dirs, **density_outputs)
             # print(deltas[:,1].mean())
             sigmas = -torch.log(1-alphas )
-            # print(sigmas.mean())
             sigmas = self.density_scale * sigmas
-
-            # print("T_TRESH_", T_thresh)
 
 
             #print(f'valid RGB query ratio: {mask.sum().item() / mask.shape[0]} (total = {mask.sum().item()})')
@@ -360,10 +449,14 @@ class NeRFRenderer(nn.Module):
                 xyzs, dirs, deltas = raymarching.march_rays(n_alive, n_step, rays_alive, rays_t, rays_o, rays_d, self.bound, self.density_bitfield, self.cascade, self.grid_size, nears, fars, 128, perturb if step == 0 else False, dt_gamma, max_steps)
 
                 alphas, rgbs = self(xyzs, dirs)
+                # alphas = (alphas*5  + 5*(alphas + ((alphas > 0.5).float() - alphas).detach())) / 10
+                # ratio = min((self.epoch / self.target_epoch), 1.0)
+                # alphas = (alphas * (1-ratio) + (ratio)*(alphas  + ((alphas > 0.5).float() - alphas).detach()))
+
                 # density_outputs = self.density(xyzs) # [M,], use a dict since it may include extra things, like geo_feat for rgb.
                 # sigmas = density_outputs['sigma']
                 # rgbs = self.color(xyzs, dirs, **density_outputs)
-                sigmas = -torch.log(1-alphas) 
+                sigmas = -torch.log(1-alphas )
                 sigmas = self.density_scale * sigmas
 
 
@@ -382,7 +475,7 @@ class NeRFRenderer(nn.Module):
         
         results['depth'] = depth
         results['image'] = image
-
+        self.epoch += 1
         return results
 
     @torch.no_grad()
@@ -489,8 +582,8 @@ class NeRFRenderer(nn.Module):
                             # query density
                             alphas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
                             sigmas = -torch.log(1-alphas)
-                            print(sigmas.mean())
-                            sigmas *= self.density_scale
+                            print(alphas.mean())
+                            # sigmas = self.density_scale * alphas.float()
                             # assign 
                             tmp_grid[cas, indices] = sigmas
 
@@ -521,8 +614,8 @@ class NeRFRenderer(nn.Module):
                 # query density
                 alphas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
                 sigmas = -torch.log(1-alphas )
-                print(sigmas.mean())
-                sigmas *= self.density_scale
+                print(alphas.mean())
+                # sigmas = self.density_scale * alphas.float()
                 # assign 
                 tmp_grid[cas, indices] = sigmas
 
@@ -551,7 +644,7 @@ class NeRFRenderer(nn.Module):
         #print(f'[density grid] min={self.density_grid.min().item():.4f}, max={self.density_grid.max().item():.4f}, mean={self.mean_density:.4f}, occ_rate={(self.density_grid > 0.01).sum() / (128**3 * self.cascade):.3f} | [step counter] mean={self.mean_count}')
 
 
-    def render(self, rays_o, rays_d, staged=False, max_ray_batch=4096, **kwargs):
+    def render(self, rays_o, rays_d, staged=False, epoch=None, max_ray_batch=4096, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: pred_rgb: [B, N, 3]
 
@@ -572,16 +665,16 @@ class NeRFRenderer(nn.Module):
                 head = 0
                 while head < N:
                     tail = min(head + max_ray_batch, N)
-                    results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], **kwargs)
-                    depth[b:b+1, head:tail] = results_['depth']
+                    results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail],epoch=epoch, **kwargs)
+                    # depth[b:b+1, head:tail] = results_['depth']
                     image[b:b+1, head:tail] = results_['image']
                     head += max_ray_batch
             
             results = {}
-            results['depth'] = depth
+            # results['depth'] = depth
             results['image'] = image
 
         else:
-            results = _run(rays_o, rays_d, **kwargs)
+            results = _run(rays_o, rays_d,epoch=epoch, **kwargs)
 
         return results
