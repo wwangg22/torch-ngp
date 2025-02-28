@@ -114,6 +114,7 @@ class NeRFDataset:
         # auto-detect transforms.json and split mode.
         if os.path.exists(os.path.join(self.root_path, 'transforms.json')):
             self.mode = 'colmap' # manually split, use view-interpolation for test.
+            # print(self.mode)
         elif os.path.exists(os.path.join(self.root_path, 'transforms_train.json')):
             self.mode = 'blender' # provided split
         else:
@@ -184,6 +185,7 @@ class NeRFDataset:
         else:
             # for colmap, manually split a valid set (the first frame).
             if self.mode == 'colmap':
+                print('first')
                 if type == 'train':
                     frames = frames[1:]
                 elif type == 'val':
@@ -193,16 +195,18 @@ class NeRFDataset:
             self.poses = []
             self.images = []
             for f in tqdm.tqdm(frames, desc=f'Loading {type} data'):
+                # print("hello")
                 f_path = os.path.join(self.root_path, f['file_path'])
                 if self.mode == 'blender' and '.' not in os.path.basename(f_path):
                     f_path += '.png' # so silly...
-
+                
                 # there are non-exist paths in fox...
                 if not os.path.exists(f_path):
                     continue
-                
+                # print(f['transform_matrix'])
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
+                # print("poses ", pose)
 
                 image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
                 if self.H is None or self.W is None:

@@ -15,3 +15,15 @@ dnerf/network_basis_perpoint.py
 
 **neus*
 neus/
+
+mlp.pth
+mlp.json
+nerf_8vec/
+nerf_food/
+nerf_vanilla/
+obj/
+obj_phone/
+test/
+test_phone/
+
+frontend/

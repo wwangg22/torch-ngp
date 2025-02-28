@@ -8,6 +8,19 @@ import tinycudann as tcnn
 from activation import trunc_exp
 from .renderer_mobile import NeRFRenderer
 
+class ColorNet(nn.Module):
+    def __init__(self, in_dim_color, hidden_dim_color):
+        super(ColorNet, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_dim_color, hidden_dim_color),  # 1st hidden layer
+            nn.ReLU(),
+            nn.Linear(hidden_dim_color, hidden_dim_color),  # 2nd hidden layer
+            nn.ReLU(),
+            nn.Linear(hidden_dim_color, 3)  # Output layer, no activation
+        )
+
+    def forward(self, x):
+        return self.model(x)
 
 class NeRFNetwork(NeRFRenderer):
     def __init__(self,
@@ -15,7 +28,7 @@ class NeRFNetwork(NeRFRenderer):
                  encoding_dir="SphericalHarmonics",
                  num_layers=2,
                  hidden_dim=64,
-                 geo_feat_dim=7,
+                 geo_feat_dim=8,
                  hidden_dim_color=16,
                  bound=1,
                  **kwargs
@@ -56,17 +69,18 @@ class NeRFNetwork(NeRFRenderer):
         self.hidden_dim_color = hidden_dim_color
         self.in_dim_color = self.geo_feat_dim + 3
 
-        self.color_net = tcnn.Network(
-            n_input_dims=self.in_dim_color,
-            n_output_dims=3,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": hidden_dim_color,
-                "n_hidden_layers": 2,
-            },
-        )
+        # self.color_net = tcnn.Network(
+        #     n_input_dims=self.in_dim_color,
+        #     n_output_dims=3,
+        #     network_config={
+        #         "otype": "FullyFusedMLP",
+        #         "activation": "ReLU",
+        #         "output_activation": "None",
+        #         "n_neurons": hidden_dim_color,
+        #         "n_hidden_layers": 2,
+        #     },
+        # )
+        self.color_net = ColorNet(self.in_dim_color, hidden_dim_color)
 
 
     
@@ -148,7 +162,12 @@ class NeRFNetwork(NeRFRenderer):
         else:
             rgbs = h
 
-        return rgbs        
+        return rgbs
+    
+    def just_color(self, x):
+        h = self.color_net(x)
+        h = torch.sigmoid(h)
+        return h
 
     # optimizer utils
     def get_params(self, lr):

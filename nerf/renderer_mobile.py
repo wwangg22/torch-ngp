@@ -154,7 +154,7 @@ class NeRFRenderer(nn.Module):
     def run(self, rays_o, rays_d, epoch=None, num_steps=128, upsample_steps=128, bg_color=None, perturb=False, **kwargs):
         if self.mobileNERF:
             print("epoch ", epoch)
-            if epoch is not None and epoch > 50:
+            if epoch is not None and epoch > 60:
                 threshold = 0.1
             else:
                 threshold = -100000
@@ -196,9 +196,10 @@ class NeRFRenderer(nn.Module):
             rgbs = rgbs.view(N, -1, 3)
             
             image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2).unsqueeze(0)
+            # print("image ", image.shape)
             
-            image_b = torch.sum(weights_b.unsqueeze(-1) * rgbs, dim=-2).unsqueeze(0)          
-            
+            image_b = torch.sum(weights_b.unsqueeze(-1) * rgbs, dim=-2).unsqueeze(0)  
+            # print("image_b ", image_b.shape)        
             acc_grid_masks = get_acc_grid_masks(pts, self.acc_grid, self.grid_min, self.grid_max, self.grid_size)
             acc_grid_masks = acc_grid_masks*grid_masks
             # print("acc_grid_masks ", acc_grid_masks.shape)
@@ -660,7 +661,7 @@ class NeRFRenderer(nn.Module):
         if staged and not self.cuda_ray:
             depth = torch.empty((B, N), device=device)
             image = torch.empty((B, N, 3), device=device)
-
+            image_b = torch.empty((B, N, 3), device=device)
             for b in range(B):
                 head = 0
                 while head < N:
@@ -668,11 +669,14 @@ class NeRFRenderer(nn.Module):
                     results_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail],epoch=epoch, **kwargs)
                     # depth[b:b+1, head:tail] = results_['depth']
                     image[b:b+1, head:tail] = results_['image']
+                    image_b[b:b+1, head:tail] = results_['image_b']
                     head += max_ray_batch
             
             results = {}
             # results['depth'] = depth
             results['image'] = image
+            results['image_b'] = image
+          
 
         else:
             results = _run(rays_o, rays_d,epoch=epoch, **kwargs)

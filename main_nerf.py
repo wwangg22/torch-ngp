@@ -4,6 +4,7 @@ import argparse
 from nerf.provider import NeRFDataset
 from nerf.gui import NeRFGUI
 from nerf.utils_mobile import *
+from nerf.bake import bake
 
 from functools import partial
 from loss import huber_loss
@@ -61,6 +62,10 @@ if __name__ == '__main__':
     parser.add_argument('--error_map', action='store_true', help="use error map to sample rays")
     parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
     parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
+
+    #mobile nerf options
+    parser.add_argument('--stage2', action='store_true', help="use mobile nerf")
+    parser.add_argument('--stage3', action='store_true', help="use mobile nerf")
 
     opt = parser.parse_args()
 
@@ -148,7 +153,7 @@ if __name__ == '__main__':
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=1, mobileNERF=True)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=5, mobileNERF=True, stage2=opt.stage2)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)
@@ -157,15 +162,18 @@ if __name__ == '__main__':
         else:
             valid_loader = NeRFDataset(opt, device=device, type='val', downscale=1).dataloader()
 
-            max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
-            trainer.train(train_loader, valid_loader, max_epoch)
+            if opt.stage3:
+                bake(model, dir=opt.workspace, train_loader=train_loader)
+            else:
+                max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
+                trainer.train(train_loader, valid_loader, max_epoch)
 
-            # also test
-            test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
-            
-            if test_loader.has_gt:
-                trainer.evaluate(test_loader) # blender has gt, so evaluate it.
-            
-            trainer.test(test_loader, write_video=True) # test and save video
-            
-            trainer.save_mesh(resolution=256, threshold=10)
+                # also test
+                test_loader = NeRFDataset(opt, device=device, type='test').dataloader()
+                
+                if test_loader.has_gt:
+                    trainer.evaluate(test_loader) # blender has gt, so evaluate it.
+                
+                trainer.test(test_loader, write_video=True) # test and save video
+                
+                trainer.save_mesh(resolution=256, threshold=10)

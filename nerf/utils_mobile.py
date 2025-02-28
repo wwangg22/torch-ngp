@@ -52,7 +52,7 @@ def srgb_to_linear(x):
 
 
 @torch.cuda.amp.autocast(enabled=False)
-def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
+def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1, supersampling = False):
     ''' get rays
     Args:
         poses: [B, 4, 4], cam2world
@@ -116,6 +116,22 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
 
         i = torch.gather(i, -1, inds)
         j = torch.gather(j, -1, inds)
+        
+        if supersampling:
+            offsets = torch.tensor([
+                [-0.25, -0.25],
+                [ 0.25, -0.25],
+                [-0.25,  0.25],
+                [ 0.25,  0.25],
+            ], device=device)
+
+            # i, j each have shape [B, N]. Make them [B, N, 1] so we can add offsets [4, 2].
+            i_sub = i.unsqueeze(-1) + offsets[:, 0]  # => [B, N, 4]
+            j_sub = j.unsqueeze(-1) + offsets[:, 1]  # => [B, N, 4]
+
+            # Flatten the last dimension => shape [B, 4*N]
+            i = i_sub.reshape(B, -1)
+            j = j_sub.reshape(B, -1)
 
         results['inds'] = inds
 
@@ -339,6 +355,7 @@ class Trainer(object):
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
                  mobileNERF=False,
+                 stage2=False,
                  ):
         
         self.name = name
@@ -362,6 +379,7 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+        self.stage2 = stage2
 
         model.to(self.device)
         if self.world_size > 1:
@@ -551,6 +569,7 @@ class Trainer(object):
             # 5) Finally, take the mean
             point_loss = point_loss.mean()
             print("acc grid mean", self.model.acc_grid.mean())
+            print("loss_b ", loss_b.mean())
             print(point_loss, loss_acc)
 
         # patch-based rendering
@@ -592,9 +611,18 @@ class Trainer(object):
 
             # put back
             self.error_map[index] = error_map
-        loss += point_loss
-        loss += loss_acc
-        loss = loss.mean()
+        
+        
+        if self.stage2 or epoch > 75:
+            loss = loss.mean() / 2.0
+            loss += point_loss
+            loss += loss_acc
+            loss += loss_b.mean() / 2.0
+            return pred_rgb, pred_rgb_b, gt_rgb, loss
+        else:
+            loss = loss.mean()
+            loss += point_loss
+            loss += loss_acc
 
         # extra loss
         # pred_weights_sum = outputs['weights_sum'] + 1e-8
@@ -603,7 +631,7 @@ class Trainer(object):
 
         return pred_rgb, gt_rgb, loss
 
-    def eval_step(self, data):
+    def eval_step(self, data, epoch):
 
         rays_o = data['rays_o'] # [B, N, 3]
         rays_d = data['rays_d'] # [B, N, 3]
@@ -620,8 +648,15 @@ class Trainer(object):
         else:
             gt_rgb = images
         
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, epoch=epoch, bg_color=bg_color, perturb=False, **vars(self.opt))
         if self.mobileNERF:
+            if self.stage2 or epoch > 75:
+                pred_rgb = outputs['image'].reshape(B, H, W, 3)
+                pred_rgb_b = outputs['image_b'].reshape(B, H, W, 3)
+                loss = self.criterion(pred_rgb, gt_rgb).mean()
+                loss += self.criterion(pred_rgb_b, gt_rgb).mean()
+                return pred_rgb, pred_rgb_b, gt_rgb, loss
+            
             pred_rgb = outputs['image'].reshape(B, H, W, 3)
            
             loss = self.criterion(pred_rgb, gt_rgb).mean()
@@ -689,6 +724,12 @@ class Trainer(object):
         self.error_map = train_loader._data.error_map
         
         for epoch in range(self.epoch + 1, max_epochs + 1):
+            
+            if self.epoch % self.eval_interval == 0:
+                self.evaluate_one_epoch(valid_loader, epoch)
+                self.save_checkpoint(full=False, best=True)
+                
+            
             self.epoch = epoch
 
             self.train_one_epoch(train_loader, epoch)
@@ -696,9 +737,7 @@ class Trainer(object):
             if self.workspace is not None and self.local_rank == 0:
                 self.save_checkpoint(full=True, best=False)
 
-            if self.epoch % self.eval_interval == 0:
-                self.evaluate_one_epoch(valid_loader)
-                self.save_checkpoint(full=False, best=True)
+           
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
@@ -792,7 +831,10 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+                if self.stage2:
+                    preds, preds_b, truths, loss = self.train_step(data, self.epoch)
+                else:
+                    preds, truths, loss = self.train_step(data)
          
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -907,7 +949,10 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data, epoch)
+                if self.stage2 or epoch > 75:
+                    preds, preds_b, truths, loss = self.train_step(data, epoch)
+                else:
+                    preds, truths, loss = self.train_step(data, epoch)
          
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -958,7 +1003,7 @@ class Trainer(object):
         self.log(f"==> Finished Epoch {self.epoch}.")
 
 
-    def evaluate_one_epoch(self, loader, name=None):
+    def evaluate_one_epoch(self, loader, epoch, name=None):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
 
         if name is None:
@@ -986,9 +1031,12 @@ class Trainer(object):
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     if self.mobileNERF:
-                        preds, truths, loss = self.eval_step(data)
+                        if self.stage2 or epoch > 75:
+                            preds, preds_b, truths, loss = self.eval_step(data, epoch)
+                        else:
+                            preds, truths, loss = self.eval_step(data, epoch)
                     else:
-                        preds, preds_depth, truths, loss = self.eval_step(data)
+                        preds, preds_depth, truths, loss = self.eval_step(data, epoch)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -1029,6 +1077,14 @@ class Trainer(object):
                     pred = preds[0].detach().cpu().numpy()
                     pred = (pred * 255).astype(np.uint8)
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+                    
+                    if self.stage2 or epoch > 75:
+                        if self.opt.color_space == 'linear':
+                            preds_b = linear_to_srgb(preds_b)
+                        
+                        pred_b = preds_b[0].detach().cpu().numpy()
+                        pred_b = (pred_b * 255).astype(np.uint8)
+                        cv2.imwrite(save_path.replace("_rgb", "_rgb_b"), cv2.cvtColor(pred_b, cv2.COLOR_RGB2BGR))
                     if not self.mobileNERF:
                         pred_depth = preds_depth[0].detach().cpu().numpy()
                         pred_depth = (pred_depth * 255).astype(np.uint8)
